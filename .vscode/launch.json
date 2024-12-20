@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(lldb) Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/ImageCapturer",
+            "args": ["/Users/tomislavkordic/Downloads/Poor Things (2023) [1080p] [WEBRip] [5.1] [YTS.MX]/Poor.Things.2023.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4"],
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        },
+    ]
+}
