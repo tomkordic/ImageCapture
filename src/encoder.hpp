@@ -4,6 +4,7 @@
 // FFmpeg headers
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavformat/avformat.h>
@@ -48,9 +49,14 @@ public:
      */
     void flushEncoder();
 private:
+    SwsContext *swsContext;
+    AVFrame *resizedFrame;
     AVCodecContext *codecContext; ///< Pointer to the FFmpeg codec context.
     FILE *file;                   ///< Pointer to the output file.
     int frameCounter;             ///< Counter for frame presentation timestamps (PTS).
+
+    void saveCurrentFrameToFile();
+    void resize(AVFrame *frame);
 };
 
 #endif // ENCODER_HPP

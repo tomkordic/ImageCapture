@@ -1,6 +1,10 @@
 {
   "cmake.buildDirectory": "${workspaceFolder}/build",
   "files.associations": {
-    "ostream": "cpp"
+    "ostream": "cpp",
+    "array": "cpp",
+    "string": "cpp",
+    "string_view": "cpp",
+    "vector": "cpp"
   }
 }
