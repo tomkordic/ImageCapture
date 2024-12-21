@@ -13,11 +13,13 @@ message(FFMPEG_INCLUDE_DIRS: ${FFMPEG_INCLUDE_DIRS})
 # Specify the C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+add_definitions(-D__STDC_CONSTANT_MACROS)
 
 set(SRC 
     src/main.cpp
     src/encoder.cpp
     src/decoder.cpp
+    src/avframequeue.cpp
 )
 
 # Add the executable

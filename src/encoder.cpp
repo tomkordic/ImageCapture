@@ -6,38 +6,14 @@
 #include <sstream>
 #include <string>
 
-Encoder::Encoder(const std::string &outputFile, int width, int height, int fps)
-    : codecContext(nullptr), file(nullptr), frameCounter(0) {
+Encoder::Encoder(const std::string &outputFile, int width, int height,
+                 int encodeFrequency)
+    : codecContext(nullptr), file(nullptr), processedFrameCounter(0), receivedFrameCounter(0), resizedFrames(50),
+      swsContext(nullptr), state(EncoderState::LoadingEncoder),
+      encodeFrequency(encodeFrequency), width(width), height(height),
+      numberOfInputFramesToGetFirstNalu(-1) {
 
-  // Find the H.265 encoder
-  const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
-  if (!codec) {
-    throw std::runtime_error("H.265 encoder not found");
-  }
-
-  // Allocate codec context
-  codecContext = avcodec_alloc_context3(codec);
-  if (!codecContext) {
-    throw std::runtime_error("Failed to allocate codec context");
-  }
-
-  // Set encoding parameters
-  codecContext->bit_rate = 400000; // Bitrate in bits per second
-  codecContext->width = width;
-  codecContext->height = height;
-  codecContext->time_base = AVRational{1, fps};
-  codecContext->framerate = AVRational{fps, 1};
-  codecContext->gop_size = 10;    // Group of pictures size
-  codecContext->max_b_frames = 1; // Allow one B-frame
-  codecContext->pix_fmt = AV_PIX_FMT_YUV420P;
-
-  // init image rescale
-  resizedFrame = av_frame_alloc();
-
-  // Open codec
-  if (avcodec_open2(codecContext, codec, nullptr) < 0) {
-    throw std::runtime_error("Failed to open codec");
-  }
+  initEncoder();
 
   // Open output file
   file = fopen(outputFile.c_str(), "wb");
@@ -48,27 +24,22 @@ Encoder::Encoder(const std::string &outputFile, int width, int height, int fps)
 
 Encoder::~Encoder() {
   // Flush the encoder and write any remaining packets
-  flushEncoder();
+  flushEncoder(FlushOption::FlushLastFrame);
 
   // Close and cleanup
   if (file) {
     fclose(file);
   }
-  if (codecContext) {
-    avcodec_free_context(&codecContext);
-  }
-  if (resizedFrame) {
-    av_frame_free(&resizedFrame);
-  }
+  releaseEncoder();
   if (swsContext) {
     sws_freeContext(swsContext);
   }
 }
 
-void Encoder::saveCurrentFrameToFile() {
+void Encoder::saveCurrentFrameToFile(AVFrame *resizedFrame) {
   std::ostringstream fileName;
   fileName << "/Users/tomislavkordic/ocean_eye/image_capture/frames/frame"
-           << "_" << std::setw(3) << std::setfill('0') << frameCounter
+           << "_" << std::setw(3) << std::setfill('0') << processedFrameCounter
            << ".yuv";
   // Open the file for writing
   std::ofstream file(fileName.str());
@@ -103,7 +74,7 @@ void Encoder::saveCurrentFrameToFile() {
   file.close();
 }
 
-void Encoder::resize(AVFrame *frame) {
+AVFrame *Encoder::resize(AVFrame *frame) {
   if (swsContext == nullptr) {
     swsContext =
         sws_getContext(frame->width, frame->height,
@@ -115,32 +86,47 @@ void Encoder::resize(AVFrame *frame) {
       throw std::invalid_argument(
           "Error: Could not initialize scaling context");
     }
-    if (av_image_alloc(resizedFrame->data, resizedFrame->linesize,
-                       codecContext->width, codecContext->height,
-                       codecContext->pix_fmt, 32) < 0) {
-      throw std::invalid_argument(
-          "Error: Could not allocate resized frame buffer");
+    // init rescale images
+    for (int i = 0; i < resizedFrames.getMaxSize(); i++) {
+      AVFrame *resizedFrame = av_frame_alloc();
+      if (av_image_alloc(resizedFrame->data, resizedFrame->linesize,
+                         codecContext->width, codecContext->height,
+                         codecContext->pix_fmt, 32) < 0) {
+        throw std::invalid_argument(
+            "Error: Could not allocate resized frame buffer");
+      }
+      resizedFrame->width = codecContext->width;
+      resizedFrame->height = codecContext->height;
+      resizedFrame->format = codecContext->pix_fmt;
+      resizedFrame->pts = -1;
+      resizedFrames.push(resizedFrame);
     }
-    resizedFrame->width = codecContext->width;
-    resizedFrame->height = codecContext->height;
-    resizedFrame->format = codecContext->pix_fmt;
   }
+  AVFrame *resizedFrame = resizedFrames.pop();
   sws_scale(swsContext, frame->data, frame->linesize, 0, frame->height,
             resizedFrame->data, resizedFrame->linesize);
   // TODO: check if this was done correctly, save these to the file
   // if (framesReceived % 900 == 0) {
   //   std::cout << "Saving frame: " << framesReceived << std::endl;
-  //   saveCurrentFrameToFile();
+  //   saveCurrentFrameToFile(resizedFrame);
   // }
+  return resizedFrame;
 }
 
 void Encoder::encodeFrame(AVFrame *frame) {
   if (!frame) {
     throw std::invalid_argument("Input frame is null");
   }
-
-  resize(frame);
-  resizedFrame->pts = frameCounter++;
+  if (state == EncoderState::ExtractingFrames &&
+      receivedFrameCounter % encodeFrequency != 0) {
+    // Ignore this frame
+    receivedFrameCounter++;
+    return;
+  }
+  receivedFrameCounter ++;
+  AVFrame *resizedFrame = resize(frame);
+  resizedFrame->pts = processedFrameCounter++;
+  std::cout << "Processing packet with pts: " << resizedFrame->pts << std::endl;
 
   // Send the frame to the encoder
   int result = avcodec_send_frame(codecContext, resizedFrame);
@@ -148,29 +134,120 @@ void Encoder::encodeFrame(AVFrame *frame) {
     throw std::runtime_error("Failed to send frame to encoder");
   }
 
+  resizedFrames.push(resizedFrame);
+
   // Receive encoded packets
   AVPacket *packet = av_packet_alloc();
   packet->data = nullptr;
   packet->size = 0;
 
-  while (avcodec_receive_packet(codecContext, packet) == 0) {
-    fwrite(packet->data, 1, packet->size, file); // Write packet to file
-    av_packet_unref(packet);                     // Free the packet
+  int frame_received = avcodec_receive_packet(codecContext, packet);
+  while (frame_received == 0) {
+    if (state == EncoderState::LoadingEncoder) {
+      state = EncoderState::ExtractingFrames;
+      flushEncoder(FlushOption::FlushAllFrames);
+      numberOfInputFramesToGetFirstNalu = processedFrameCounter;
+    }
+    if (state == EncoderState::ExtractingFrames) {
+      flushEncoder(FlushOption::FlushLastFrame);
+    }
+    av_packet_unref(packet); // Free the packet
+    frame_received = avcodec_receive_packet(codecContext, packet);
+  }
+  if (frame_received == 0) {
+    resetAndLoad();
   }
   av_packet_free(&packet);
 }
 
-void Encoder::flushEncoder() {
+void Encoder::initEncoder() {
+  // Find the H.265 encoder
+  const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
+  if (!codec) {
+    throw std::runtime_error("H.265 encoder not found");
+  }
+
+  // Allocate codec context
+  codecContext = avcodec_alloc_context3(codec);
+  if (!codecContext) {
+    throw std::runtime_error("Failed to allocate codec context");
+  }
+
+  // Set encoding parameters
+  codecContext->bit_rate = 400000; // Bitrate in bits per second
+  codecContext->width = width;
+  codecContext->height = height;
+  codecContext->time_base = AVRational{1, 15};
+  codecContext->framerate = AVRational{15, 1};
+  codecContext->gop_size = 10;    // Group of pictures size
+  codecContext->max_b_frames = 1; // Allow one B-frame
+  codecContext->pix_fmt = AV_PIX_FMT_YUV420P;
+
+  // Open codec
+  if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+    throw std::runtime_error("Failed to open codec");
+  }
+}
+
+void Encoder::releaseEncoder() {
+  if (codecContext) {
+    avcodec_free_context(&codecContext);
+  }
+}
+
+void Encoder::resetAndLoad() {
+  releaseEncoder();
+  initEncoder();
+  // Feed with all available queued images
+  int lastPts = -1;
+  int loop = 0;
+  while (true) {
+    loop++;
+    AVFrame *frame = resizedFrames.peek();
+    if (frame->pts == -1) {
+      // uninit frame skip
+      resizedFrames.pop();
+      resizedFrames.push(frame);
+      continue;
+    }
+    if (frame->pts <= lastPts && lastPts != -1) {
+      // Full circle, stop feeding
+      break;
+    }
+    lastPts = frame->pts;
+    int result = avcodec_send_frame(codecContext, frame);
+    if (result < 0) {
+      throw std::runtime_error("Failed to send frame to encoder");
+    } else {
+      std::cout << "Preloading frame with pts: " << frame->pts << std::endl;
+    }
+    resizedFrames.pop();
+    resizedFrames.push(frame);
+  }
+  std::cout << "Encoder reset done !" << std::endl;
+}
+
+void Encoder::flushEncoder(FlushOption option) {
   // Send a null frame to signal the end of the stream
   if (avcodec_send_frame(codecContext, nullptr) >= 0) {
     AVPacket *packet = av_packet_alloc();
+    AVPacket *last_packet = av_packet_alloc();
     packet->data = nullptr;
     packet->size = 0;
 
     while (avcodec_receive_packet(codecContext, packet) == 0) {
-      fwrite(packet->data, 1, packet->size, file); // Write packet to file
-      av_packet_unref(packet);                     // Free the packet
+      if (option == FlushOption::FlushAllFrames) {
+        fwrite(packet->data, 1, packet->size, file); // Write packet to file
+      }
+      if (packet->size > 0) {
+        last_packet = av_packet_clone(packet);
+      }
+      av_packet_unref(packet); // Free the packet
     }
+    if (option == FlushOption::FlushLastFrame) {
+      fwrite(last_packet->data, 1, last_packet->size, file); // Write last packet to file
+    }
+    av_packet_free(&last_packet);
     av_packet_free(&packet);
   }
 }
