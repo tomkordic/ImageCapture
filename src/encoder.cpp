@@ -8,10 +8,10 @@
 
 Encoder::Encoder(const std::string &outputFile, int width, int height,
                  int encodeFrequency)
-    : codecContext(nullptr), file(nullptr), processedFrameCounter(0), receivedFrameCounter(0), resizedFrames(50),
-      swsContext(nullptr), state(EncoderState::LoadingEncoder),
-      encodeFrequency(encodeFrequency), width(width), height(height),
-      numberOfInputFramesToGetFirstNalu(-1) {
+    : codecContext(nullptr), file(nullptr), processedFrameCounter(0),
+      receivedFrameCounter(0), resizedFrames(5), swsContext(nullptr),
+      state(EncoderState::LoadingEncoder), encodeFrequency(encodeFrequency),
+      width(width), height(height), numberOfInputFramesToGetFirstNalu(-1) {
 
   initEncoder();
 
@@ -119,11 +119,11 @@ void Encoder::encodeFrame(AVFrame *frame) {
   }
   if (state == EncoderState::ExtractingFrames &&
       receivedFrameCounter % encodeFrequency != 0) {
-    // Ignore this frame
     receivedFrameCounter++;
     return;
   }
-  receivedFrameCounter ++;
+
+  receivedFrameCounter++;
   AVFrame *resizedFrame = resize(frame);
   resizedFrame->pts = processedFrameCounter++;
   std::cout << "Processing packet with pts: " << resizedFrame->pts << std::endl;
@@ -145,17 +145,11 @@ void Encoder::encodeFrame(AVFrame *frame) {
   while (frame_received == 0) {
     if (state == EncoderState::LoadingEncoder) {
       state = EncoderState::ExtractingFrames;
-      flushEncoder(FlushOption::FlushAllFrames);
       numberOfInputFramesToGetFirstNalu = processedFrameCounter;
     }
-    if (state == EncoderState::ExtractingFrames) {
-      flushEncoder(FlushOption::FlushLastFrame);
-    }
-    av_packet_unref(packet); // Free the packet
+    fwrite(packet->data, 1, packet->size, file); // Write last packet to file
+    av_packet_unref(packet);                     // Free the packet
     frame_received = avcodec_receive_packet(codecContext, packet);
-  }
-  if (frame_received == 0) {
-    resetAndLoad();
   }
   av_packet_free(&packet);
 }
@@ -183,10 +177,24 @@ void Encoder::initEncoder() {
   codecContext->max_b_frames = 1; // Allow one B-frame
   codecContext->pix_fmt = AV_PIX_FMT_YUV420P;
 
-  // Open codec
-  if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+  // Prepare the AVDictionary for x265-specific options
+  AVDictionary *codecOptions = nullptr;
+
+  // Set x265-specific parameters
+  av_dict_set(&codecOptions, "x265-params",
+              "keyint=1:scenecut=0:lookahead=0:vbv-bufsize=0", 0);
+
+  // Open the codec
+  if (avcodec_open2(codecContext, codec, &codecOptions) < 0) {
+    std::cerr << "Failed to open codec\n";
+    avcodec_free_context(&codecContext);
+    av_dict_free(&codecOptions);
     throw std::runtime_error("Failed to open codec");
   }
+
+  // Clean up
+  av_dict_free(&codecOptions);
+  avcodec_free_context(&codecContext);
 }
 
 void Encoder::releaseEncoder() {
@@ -245,7 +253,8 @@ void Encoder::flushEncoder(FlushOption option) {
       av_packet_unref(packet); // Free the packet
     }
     if (option == FlushOption::FlushLastFrame) {
-      fwrite(last_packet->data, 1, last_packet->size, file); // Write last packet to file
+      fwrite(last_packet->data, 1, last_packet->size,
+             file); // Write last packet to file
     }
     av_packet_free(&last_packet);
     av_packet_free(&packet);
